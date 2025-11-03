@@ -26,7 +26,8 @@ func main() {
     // Define routes
     http.HandleFunc("/api/login", corsMiddleware(loginHandler))
     http.HandleFunc("/api/health", healthHandler)
-    http.HandleFunc("/api/external-data", externalDataHandler) // Example external API
+    http.HandleFunc("/api/external-data", externalDataHandler)
+      http.HandleFunc("/", rootHandler) // Example external API
 
     port := ":8080"
     fmt.Printf("Go API server starting on http://localhost%s\n", port)
@@ -99,4 +100,8 @@ func externalDataHandler(w http.ResponseWriter, r *http.Request) {
     }
     
     json.NewEncoder(w).Encode(externalData)
+}
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/plain")
+    fmt.Fprintln(w, "Hello, world! Welcome to vesto.cloud")
 }
