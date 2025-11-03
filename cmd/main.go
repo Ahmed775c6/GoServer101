@@ -2,106 +2,291 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "log"
-    "net/http"
-    "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/crypto/bcrypt"
 )
 
+type User struct {
+	ID       primitive.ObjectID `json:"id" bson:"_id,omitempty"`
+	Name     string             `json:"name" bson:"name"`
+	Email    string             `json:"email" bson:"email"`
+	Password string             `json:"password,omitempty" bson:"password"`
+	Company  string             `json:"company" bson:"company"`
+	Plan     string             `json:"plan" bson:"plan"`
+	CreatedAt time.Time         `json:"createdAt" bson:"createdAt"`
+}
+
 type LoginRequest struct {
-    Email    string `json:"email"`
-    Password string `json:"password"`
-    Remember bool   `json:"rememberMe"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Remember bool   `json:"rememberMe"`
 }
 
 type LoginResponse struct {
-    Success bool   `json:"success"`
-    Message string `json:"message"`
-    UserID  int    `json:"userId,omitempty"`
-    Token   string `json:"token,omitempty"`
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	UserID  string `json:"userId,omitempty"`
+	Token   string `json:"token,omitempty"`
+	User    *User  `json:"user,omitempty"`
 }
 
-func main() {
-    // Define routes
-    http.HandleFunc("/api/login", corsMiddleware(loginHandler))
-    http.HandleFunc("/api/health", healthHandler)
-    http.HandleFunc("/api/external-data", externalDataHandler)
-      http.HandleFunc("/", rootHandler) // Example external API
+type RegisterRequest struct {
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Company  string `json:"company"`
+}
 
-    port := ":8080"
-    fmt.Printf("Go API server starting on http://localhost%s\n", port)
-    log.Fatal(http.ListenAndServe(port, nil))
+var mongoClient *mongo.Client
+var userCollection *mongo.Collection
+
+func main() {
+	// MongoDB setup
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	var err error
+	mongoClient, err = mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		log.Fatal("MongoDB connection error: ", err)
+	}
+	
+	// Verify connection
+	err = mongoClient.Ping(ctx, nil)
+	if err != nil {
+		log.Fatal("MongoDB ping error: ", err)
+	}
+	
+	fmt.Println("Connected to MongoDB successfully!")
+	
+	userCollection = mongoClient.Database("VestoDB").Collection("users")
+	
+	// Create unique index on email
+	indexModel := mongo.IndexModel{
+		Keys:    bson.M{"email": 1},
+		Options: options.Index().SetUnique(true),
+	}
+	_, err = userCollection.Indexes().CreateOne(ctx, indexModel)
+	if err != nil {
+		log.Println("Warning: Could not create unique index on email:", err)
+	}
+
+	// Define routes
+	http.HandleFunc("/api/register", corsMiddleware(registerHandler))
+	http.HandleFunc("/api/login", corsMiddleware(loginHandler))
+	http.HandleFunc("/api/health", corsMiddleware(healthHandler))
+	http.HandleFunc("/api/external-data", corsMiddleware(externalDataHandler))
+	http.HandleFunc("/", corsMiddleware(rootHandler))
+
+	port := ":8080"
+	fmt.Printf("Go API server starting on http://localhost%s\n", port)
+	log.Fatal(http.ListenAndServe(port, nil))
 }
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Access-Control-Allow-Origin", "*")
-        w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        
-        if r.Method == "OPTIONS" {
-            w.WriteHeader(http.StatusOK)
-            return
-        }
-        
-        next(w, r)
-    }
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		next(w, r)
+	}
+}
+
+func hashPassword(password string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return string(bytes), err
+}
+
+func checkPasswordHash(password, hash string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
+}
+
+func registerHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	if r.Method != "POST" {
+		http.Error(w, `{"success": false, "message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"success": false, "message": "Invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields
+	if req.Name == "" || req.Email == "" || req.Password == "" {
+		http.Error(w, `{"success": false, "message": "Name, email, and password are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Check if user already exists
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	var existingUser User
+	err := userCollection.FindOne(ctx, bson.M{"email": req.Email}).Decode(&existingUser)
+	if err == nil {
+		http.Error(w, `{"success": false, "message": "User with this email already exists"}`, http.StatusConflict)
+		return
+	}
+
+	// Hash password
+	hashedPassword, err := hashPassword(req.Password)
+	if err != nil {
+		http.Error(w, `{"success": false, "message": "Error processing password"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Create new user
+	newUser := User{
+		Name:      req.Name,
+		Email:     req.Email,
+		Password:  hashedPassword,
+		Company:   req.Company,
+		Plan:      "Essential",
+		CreatedAt: time.Now(),
+	}
+
+	result, err := userCollection.InsertOne(ctx, newUser)
+	if err != nil {
+		http.Error(w, `{"success": false, "message": "Failed to create user"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Return success response without password
+	newUser.Password = ""
+	newUser.ID = result.InsertedID.(primitive.ObjectID)
+	
+	response := map[string]interface{}{
+		"success": true,
+		"message": "User registered successfully",
+		"user":    newUser,
+	}
+	
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(response)
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    
-    if r.Method != "POST" {
-        http.Error(w, `{"success": false, "message": "Method not allowed"}`, http.StatusMethodNotAllowed)
-        return
-    }
+	w.Header().Set("Content-Type", "application/json")
+	
+	if r.Method != "POST" {
+		http.Error(w, `{"success": false, "message": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
 
-    var loginReq LoginRequest
-    err := json.NewDecoder(r.Body).Decode(&loginReq)
-    if err != nil {
-        http.Error(w, `{"success": false, "message": "Invalid JSON"}`, http.StatusBadRequest)
-        return
-    }
+	var loginReq LoginRequest
+	err := json.NewDecoder(r.Body).Decode(&loginReq)
+	if err != nil {
+		http.Error(w, `{"success": false, "message": "Invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
 
-    // Simple authentication logic
-    if loginReq.Email == "test@example.com" && loginReq.Password == "password" {
-        response := LoginResponse{
-            Success: true,
-            Message: "Login successful!",
-            UserID:  123,
-            Token:   "go-jwt-token-" + fmt.Sprintf("%d", time.Now().Unix()),
-        }
-        w.WriteHeader(http.StatusOK)
-        json.NewEncoder(w).Encode(response)
-    } else {
-        response := LoginResponse{
-            Success: false,
-            Message: "Invalid email or password",
-        }
-        w.WriteHeader(http.StatusUnauthorized)
-        json.NewEncoder(w).Encode(response)
-    }
+	// Find user by email
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	var user User
+	err = userCollection.FindOne(ctx, bson.M{"email": loginReq.Email}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			response := LoginResponse{
+				Success: false,
+				Message: "Invalid email or password",
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		http.Error(w, `{"success": false, "message": "Database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Check password
+	if !checkPasswordHash(loginReq.Password, user.Password) {
+		response := LoginResponse{
+			Success: false,
+			Message: "Invalid email or password",
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Generate token (in a real application, use JWT or similar)
+	token := fmt.Sprintf("go-jwt-token-%s-%d", user.ID.Hex(), time.Now().Unix())
+
+	// Remove password from user object before sending response
+	user.Password = ""
+
+	response := LoginResponse{
+		Success: true,
+		Message: "Login successful!",
+		UserID:  user.ID.Hex(),
+		Token:   token,
+		User:    &user,
+	}
+	
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    fmt.Fprintf(w, `{"status": "healthy", "service": "Go API", "timestamp": "%s"}`, time.Now().Format(time.RFC3339))
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Check MongoDB connection
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	
+	dbStatus := "connected"
+	err := mongoClient.Ping(ctx, nil)
+	if err != nil {
+		dbStatus = "disconnected"
+	}
+	
+	healthData := map[string]interface{}{
+		"status":    "healthy",
+		"service":   "Go API",
+		"timestamp": time.Now().Format(time.RFC3339),
+		"database":  dbStatus,
+	}
+	
+	json.NewEncoder(w).Encode(healthData)
 }
 
 func externalDataHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    
-    // Example external API integration
-    externalData := map[string]interface{}{
-        "data": "This came from Go server external API",
-        "timestamp": time.Now().Unix(),
-        "source": "external_service",
-    }
-    
-    json.NewEncoder(w).Encode(externalData)
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Example external API integration
+	externalData := map[string]interface{}{
+		"data":      "This came from Go server external API",
+		"timestamp": time.Now().Unix(),
+		"source":    "external_service",
+	}
+	
+	json.NewEncoder(w).Encode(externalData)
 }
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintln(w, "Hello, world! Welcome to vesto.cloud")
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintln(w, "Hello, world! Welcome to vesto.cloud")
 }
