@@ -119,71 +119,96 @@ func checkPasswordHash(password, hash string) bool {
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	
-	if r.Method != "POST" {
-		http.Error(w, `{"success": false, "message": "Method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
+    w.Header().Set("Content-Type", "application/json")
+    
+    if r.Method != "POST" {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "success": false,
+            "message": "Method not allowed",
+        })
+        return
+    }
 
-	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"success": false, "message": "Invalid request body"}`, http.StatusBadRequest)
-		return
-	}
+    var req RegisterRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "success": false,
+            "message": "Invalid request body",
+        })
+        return
+    }
 
-	// Validate required fields
-	if req.Name == "" || req.Email == "" || req.Password == "" {
-		http.Error(w, `{"success": false, "message": "Name, email, and password are required"}`, http.StatusBadRequest)
-		return
-	}
+    // Validate required fields
+    if req.Name == "" || req.Email == "" || req.Password == "" {
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "success": false,
+            "message": "Name, email, and password are required",
+        })
+        return
+    }
 
-	// Check if user already exists
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	
-	var existingUser User
-	err := userCollection.FindOne(ctx, bson.M{"email": req.Email}).Decode(&existingUser)
-	if err == nil {
-		http.Error(w, `{"success": false, "message": "User with this email already exists"}`, http.StatusConflict)
-		return
-	}
+    // Check if user already exists
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    var existingUser User
+    err := userCollection.FindOne(ctx, bson.M{"email": req.Email}).Decode(&existingUser)
+    if err == nil {
+        w.WriteHeader(http.StatusConflict)
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "success": false,
+            "message": "User with this email already exists",
+        })
+        return
+    }
 
-	// Hash password
-	hashedPassword, err := hashPassword(req.Password)
-	if err != nil {
-		http.Error(w, `{"success": false, "message": "Error processing password"}`, http.StatusInternalServerError)
-		return
-	}
+    // Hash password
+    hashedPassword, err := hashPassword(req.Password)
+    if err != nil {
+        w.WriteHeader(http.StatusInternalServerError)
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "success": false,
+            "message": "Error processing password",
+        })
+        return
+    }
 
-	// Create new user
-	newUser := User{
-		Name:      req.Name,
-		Email:     req.Email,
-		Password:  hashedPassword,
-		Company:   req.Company,
-		Plan:      "Essential",
-		CreatedAt: time.Now(),
-	}
+    // Create new user
+    newUser := User{
+        Name:      req.Name,
+        Email:     req.Email,
+        Password:  hashedPassword,
+        Company:   req.Company,
+        Plan:      "Essential",
+        CreatedAt: time.Now(),
+    }
 
-	result, err := userCollection.InsertOne(ctx, newUser)
-	if err != nil {
-		http.Error(w, `{"success": false, "message": "Failed to create user"}`, http.StatusInternalServerError)
-		return
-	}
+    result, err := userCollection.InsertOne(ctx, newUser)
+    if err != nil {
+        w.WriteHeader(http.StatusInternalServerError)
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "success": false,
+            "message": "Failed to create user",
+        })
+        return
+    }
 
-	// Return success response without password
-	newUser.Password = ""
-	newUser.ID = result.InsertedID.(primitive.ObjectID)
-	
-	response := map[string]interface{}{
-		"success": true,
-		"message": "User registered successfully",
-		"user":    newUser,
-	}
-	
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(response)
+    // Return success response without password
+    newUser.Password = ""
+    newUser.ID = result.InsertedID.(primitive.ObjectID)
+    
+    response := map[string]interface{}{
+        "success": true,
+        "message": "User registered successfully",
+        "user":    newUser,
+        "token":   fmt.Sprintf("go-jwt-token-%s-%d", newUser.ID.Hex(), time.Now().Unix()),
+    }
+    
+    w.WriteHeader(http.StatusCreated)
+    json.NewEncoder(w).Encode(response)
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
