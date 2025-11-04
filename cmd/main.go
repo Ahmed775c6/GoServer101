@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -86,6 +87,8 @@ func main() {
 	http.HandleFunc("/api/login", corsMiddleware(loginHandler))
 	http.HandleFunc("/api/health", corsMiddleware(healthHandler))
 	http.HandleFunc("/api/external-data", corsMiddleware(externalDataHandler))
+	http.HandleFunc("/api/validate-token", corsMiddleware(validateTokenHandler))
+	http.HandleFunc("/api/user/", corsMiddleware(getUserHandler)) // Note the trailing slash
 	http.HandleFunc("/", corsMiddleware(rootHandler))
 
 	port := ":8080"
@@ -314,4 +317,145 @@ func externalDataHandler(w http.ResponseWriter, r *http.Request) {
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprintln(w, "Hello, world! Welcome to vesto.cloud")
+}
+// Add this struct
+type UserResponse struct {
+	Success bool  `json:"success"`
+	User    *User `json:"user,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// Add this handler function
+func getUserHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Extract user ID from URL path
+	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 4 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(UserResponse{
+			Success: false,
+			Message: "Invalid user ID",
+		})
+		return
+	}
+	
+	userID := pathParts[3]
+	
+	// Validate user ID
+	objID, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(UserResponse{
+			Success: false,
+			Message: "Invalid user ID format",
+		})
+		return
+	}
+	
+	// Find user by ID
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	var user User
+	err = userCollection.FindOne(ctx, bson.M{"_id": objID}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(UserResponse{
+				Success: false,
+				Message: "User not found",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(UserResponse{
+			Success: false,
+			Message: "Database error",
+		})
+		return
+	}
+	
+	// Remove password before sending
+	user.Password = ""
+	
+	response := UserResponse{
+		Success: true,
+		User:    &user,
+	}
+	
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// Add token validation endpoint
+func validateTokenHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Extract token from Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "No authorization token",
+		})
+		return
+	}
+	
+	// Simple token validation (in production, use proper JWT validation)
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	if !strings.HasPrefix(token, "go-jwt-token-") {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "Invalid token format",
+		})
+		return
+	}
+	
+	// Extract user ID from token
+	parts := strings.Split(token, "-")
+	if len(parts) < 4 {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "Invalid token",
+		})
+		return
+	}
+	
+	userID := parts[3]
+	
+	// Validate user exists
+	objID, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "Invalid user in token",
+		})
+		return
+	}
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	var user User
+	err = userCollection.FindOne(ctx, bson.M{"_id": objID}).Decode(&user)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "User not found",
+		})
+		return
+	}
+	
+	// Token is valid
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Token is valid",
+		"user_id": userID,
+	})
 }
